@@ -1,6 +1,6 @@
 #
 # linter.py
-# Linter for SublimeLinter3, a code checking framework for Sublime Text 3
+# Linter for SublimeLinter4, a code checking framework for Sublime Text 3
 #
 # Modified from VHDL to Verilog to SystemVerilog by Leon Woestenberg
 # Original:
@@ -10,18 +10,85 @@
 # License: MIT
 #
 
-"""This module exports the Xsvlog plugin class."""
+"""This module exports the SVLinter plugin class."""
 
 from SublimeLinter.lint import Linter
 import re
+import logging
+import os
+import os.path
+import subprocess
 
-class Xsvlog(Linter):
+
+def get_imports_code(code):
+    """ Searches a string for import statements """
+    imports = []
+    for line in iter(code.splitlines()):
+        line = line.strip()
+        if line.startswith("//!import"):
+            import_path = line.split("//!import", 1)[1].strip()
+            imports.append(import_path)
+        else:
+            return imports
+    return imports
+
+
+def get_imports_file(file_path):
+    """ Searches a file for import statements """
+    imports = []
+    with open(file_path, 'r') as f:
+        line = f.readline()
+        while line:
+            line = line.strip()
+            if line.startswith("//!import"):
+                import_path = line.split("//!import", 1)[1].strip()
+                imports.append(import_path)
+                line = f.readline()
+            else:
+                return imports
+
+
+def get_import_path(import_path, project_dir):
+    """ Converts a local import to a full path """
+    full_import_path = project_dir
+    for piece in import_path.split('/'):
+        full_import_path = os.path.join(full_import_path, piece)
+    return full_import_path + ".sv"
+
+
+def build_import_tree(import_path, project_dir):
+    """ Recursively iterates through files to create a tree of imports """
+    tree = {}
+    full_import_path = get_import_path(import_path, project_dir)
+    for file_import in get_imports_file(full_import_path):
+        tree[file_import] = build_import_tree(file_import, project_dir)
+    return tree
+
+
+def flatten_import_tree(import_tree):
+    """ Produces a unique value list from an import tree """
+    import_list = []
+    for import_node in import_tree:
+        for prior_import in flatten_import_tree(import_tree[import_node]):
+            if prior_import not in import_list:
+                import_list.append(prior_import)
+        if import_node not in import_list:
+            import_list.append(import_node)
+    return import_list
+
+
+class SVLinter(Linter):
 
     """Provides an interface to xvlog (from Xilinx Vivado Simulator)."""
 
-    syntax = 'systemverilog'
-    #cmd = 'xvlog -sv --work=/tmp/sublime-xvlog-work --log=/tmp/sublime-linter-sv.log $temp_file'
-    cmd = 'xvlog -sv --work work=/tmp/sublime-xvlog-work --nolog $temp_file'
+    name = "svlint"
+    defaults = {
+        "lint_mode": "load_save",
+        "disable": "false",
+        "debug": "true",
+        "selector": "source.systemverilog"
+    }
+    cmd = 'xvlog -sv --nolog'
     #version_args = '--version --nolog'
     #version_re = r'Vivado Simulator (?P<version>\d+\.\d+)'
     #version_requirement = '>= 2014.4'
@@ -36,6 +103,47 @@ class Xsvlog(Linter):
         r"^(?P<error>(ERROR|INFO): )(?P<message>\[.*\].*)"
         r"\[(?P<path>.*):(?P<line>[0-9]+)\]"
     )
+
+
+    def lint(self, code, view_has_changed):
+        """ Modifies linter to use SystemVerilog import comments """
+
+        # Find project base directory
+        project_dir = self.get_working_dir()
+        found = False
+        while not found and project_dir != os.path.dirname(project_dir):
+            # print("Searching: " + project_dir)
+            if "project.yaml" in os.listdir(project_dir):
+                # print("Found in: " + project_dir)
+                found = True
+                break
+            project_dir = os.path.dirname(project_dir)
+
+        # Create tree of imports
+        import_tree = {}
+        for file_import in get_imports_code(code):
+            import_tree[file_import] = build_import_tree(file_import, project_dir)
+        import_list = flatten_import_tree(import_tree)
+        import_paths = [get_import_path(ip, project_dir) for ip in import_list]
+
+        processes = []
+        for ip in import_paths:
+            # print("Manual Dependency: " + ip)
+            proc = subprocess.Popen("xvlog -sv --nolog " + ip, cwd=self.get_working_dir(), shell=True)
+
+        for p in processes:
+            p.communicate()
+
+        # Example tree structure
+        # {
+        #     "std/std_pkg": {}
+        #     "std/std_register":
+        #     {
+        #         "std/std_pkg": {}
+        #     }
+        # }
+
+        return super().lint(code, view_has_changed)
 
     def split_match(self, match):
         """
